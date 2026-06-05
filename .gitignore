@@ -6,6 +6,7 @@ Desktop.ini
 *.log
 .claude/
 CLAUDE.md
+docs/
 
 # Python
 __pycache__/
