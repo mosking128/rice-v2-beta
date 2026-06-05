@@ -1,6 +1,6 @@
 ﻿# RICE v2 �?Runtime Interactive C Environment (Beta)
 
-> **状态：Beta 测试版�?* RICE v2 正在活跃开发中。生产环境请使用 [RICE v1](https://github.com/mosking128/PicoScript)（稳定裸机版）�?
+> **状态：Beta 测试版�?* RICE v2 正在活跃开发中。生产环境请使用 [RICE v1](https://github.com/mosking128/rice-v1)（稳定裸机版）�?
 [English](README.md) | [中文](README_CN.md)
 
 RICE v2 �?**PicoC** C 语言解释器移植到 **STM32H750VBTx**（Cortex-M7, 480 MHz），运行�?**FreeRTOS** 之上，提供基于多任务的交互式 C 脚本环境。相�?v1 的核心架构改进是任务级隔离：串口 I/O 和脚本执行作为独立的 FreeRTOS 任务运行，使�?`:abort` 能够响应式地中断死循环，无需看门狗复位�?
@@ -129,6 +129,6 @@ picoc>             �?立即回到 REPL
 
 ## 相关项目
 
-- [RICE v1](https://github.com/mosking128/PicoScript) �?稳定裸机版本，推荐生产使�?
+- [RICE v1](https://github.com/mosking128/rice-v1) �?稳定裸机版本，推荐生产使�?
 ## 许可�?
 MIT，详�?[LICENSE](LICENSE)�?
