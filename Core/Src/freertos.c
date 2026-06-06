@@ -171,6 +171,9 @@ void StartSerialTask(void *argument)
   for(;;)
   {
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
+    /* 调试模式下 picocTask 直接消费 rx_ring，serialTask 让出 */
+    if (g_debug_input_active)
+      continue;
     /* 排空 rx_ring：一次唤醒尽可能读完所有数据 */
     for (;;)
     {

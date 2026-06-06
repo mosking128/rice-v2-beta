@@ -83,6 +83,9 @@ static volatile uint8_t tx_busy = 0U;
 /* DMA 缓冲区的上一次处理位置。用于在 DMA 中断回调中计算增量数据。 */
 static uint16_t rx_dma_last_pos = 0U;
 
+/* 调试输入激活标志：置 1 时 serialTask 停止消费 rx_ring */
+volatile int g_debug_input_active = 0;
+
 /* TX 互斥锁：保护 SerialApp_Write 在多任务环境下的并发访问 */
 static osMutexId_t tx_mutex = NULL;
 

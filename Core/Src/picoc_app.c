@@ -80,7 +80,9 @@ typedef enum
     PICOC_APP_COMMAND_PING,
     PICOC_APP_COMMAND_RESET,
     PICOC_APP_COMMAND_BKPT,
-    PICOC_APP_COMMAND_BKPTCLEAR
+    PICOC_APP_COMMAND_BKPTCLEAR,
+    PICOC_APP_COMMAND_DEBUG     /* :cont / :step / :eval / :vars / :set
+                                   仅由调试循环处理，REPL/LOAD 模式下静默消耗 */
 } PicocApp_Command;
 
 /* 全局状态 */
@@ -154,8 +156,10 @@ void PicocApp_RunSourceLine(const char *source)
 /* 重置 PicoC 解释器实例（供 picocTask 收到 MSG_RESET 时调用） */
 void PicocApp_Reset(void)
 {
+    extern volatile int g_debug_input_active;
     PicocCleanup(&g_picoc);
     PicocInitialise(&g_picoc, PICOC_APP_STACK_SIZE);
+    g_debug_input_active = 0;
 }
 
 /* 处理一批 UART 字符，返回需要入队的消息
@@ -258,6 +262,14 @@ int PicocApp_ProcessChars(const uint8_t *data, uint32_t len, TaskMsg *out_msg)
                     continue;
                 }
 
+                if (command == PICOC_APP_COMMAND_DEBUG)
+                {
+                    PicocApp_WriteString("\r\n");
+                    PicocApp_ResetSource();
+                    g_prompt_pending = 1U;
+                    continue;
+                }
+
                 /* non-command: accumulate into load_buffer (skip empty lines)
                  * 脚本执行期间跳过，防止写坏 g_load_buffer，但命令仍可处理 */
                 if (g_script_running == 0U && g_source_length > 0U)
@@ -350,6 +362,16 @@ int PicocApp_ProcessChars(const uint8_t *data, uint32_t len, TaskMsg *out_msg)
                     PicocApp_WriteString("\r\n");
                     PicocApp_HandleBkptCommand((const char *)g_source_buffer,
                                                command == PICOC_APP_COMMAND_BKPT);
+                    PicocApp_ResetSource();
+                    g_prompt_text = INTERACTIVE_PROMPT_STATEMENT;
+                    g_prompt_pending = 1U;
+                    continue;
+                }
+                if (command == PICOC_APP_COMMAND_DEBUG)
+                {
+                    /* 调试命令 (:cont/:step/:eval/:vars/:set) 在调试模式外收到，
+                     * 静默消耗，防止被当作 C 代码执行。 */
+                    PicocApp_WriteString("\r\n");
                     PicocApp_ResetSource();
                     g_prompt_text = INTERACTIVE_PROMPT_STATEMENT;
                     g_prompt_pending = 1U;
@@ -949,6 +971,7 @@ static int PicocApp_RunSource(Picoc *pc, const char *file_name, const char *sour
     }
     else
     {
+        DebugCancelStep();
         g_active_picoc = NULL;
         if (pc->AbortRequested)
         {
@@ -1038,6 +1061,23 @@ static PicocApp_Command PicocApp_ParseCommand(const uint8_t *buffer, uint32_t le
     {
         return PICOC_APP_COMMAND_BKPTCLEAR;
     }
+
+    /* 调试命令：仅在 DebugCheckStatement() 调试循环内有效。
+     * REPL/LOAD 模式下收到时识别为 DEBUG 类型，静默消耗，避免被当 C 代码执行。 */
+    if (length == 5U && memcmp(&buffer[start], ":vars", 5U) == 0)
+        return PICOC_APP_COMMAND_DEBUG;
+
+    if (length >= 6U && memcmp(&buffer[start], ":eval ", 6U) == 0)
+        return PICOC_APP_COMMAND_DEBUG;
+
+    if (length >= 5U && memcmp(&buffer[start], ":set ", 5U) == 0)
+        return PICOC_APP_COMMAND_DEBUG;
+
+    if (length >= 5U && memcmp(&buffer[start], ":cont", 5U) == 0 && (length == 5U || buffer[start + 5U] == ' ' || buffer[start + 5U] == '\t'))
+        return PICOC_APP_COMMAND_DEBUG;
+
+    if (length >= 5U && memcmp(&buffer[start], ":step", 5U) == 0 && (length == 5U || buffer[start + 5U] == ' ' || buffer[start + 5U] == '\t'))
+        return PICOC_APP_COMMAND_DEBUG;
 
     return PICOC_APP_COMMAND_NONE;
 }

@@ -94,6 +94,13 @@ uint32_t SerialApp_GetRxOverflowCount(void);
  */
 uint32_t SerialApp_GetTxOverflowCount(void);
 
+/*
+ * 调试模式标志：当 picocTask 进入调试命令循环（DebugCheckStatement）时置 1，
+ * serialTask 检测到此标志后跳过 SerialApp_Read()，避免两个任务
+ * 竞争消费 rx_ring 中的数据。
+ */
+extern volatile int g_debug_input_active;
+
 #ifdef __cplusplus
 }
 #endif

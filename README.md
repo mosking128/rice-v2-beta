@@ -1,10 +1,8 @@
-# RICE v2 — Runtime Interactive C Environment (Beta)
-
-> **Status: Beta.** RICE v2 is under active development. For production use, see [RICE v1](https://github.com/mosking128/rice-v1) (stable, bare-metal).
+# RICE v2 — Runtime Interactive C Environment
 
 [English](README.md) | [中文](README_CN.md)
 
-RICE v2 ports the **PicoC** C interpreter to **STM32H750VBTx** (Cortex-M7, 480 MHz) on top of **FreeRTOS**, providing a multi-task interactive C scripting environment. The key architectural improvement over v1 is task-level isolation: serial I/O and script execution run as separate FreeRTOS tasks, enabling responsive `:abort` of infinite loops without a watchdog reset.
+RICE v2 ports the **PicoC** C interpreter to **STM32H750VBTx** (Cortex-M7, 480 MHz) on top of **FreeRTOS**, providing a multi-task interactive C scripting environment with full debug support — breakpoints, single-stepping, variable inspection, and expression evaluation. The key architectural improvement over v1 is task-level isolation: serial I/O and script execution run as separate FreeRTOS tasks, enabling responsive `:abort` of infinite loops without a watchdog reset.
 
 Connect via `USART1` (115200 8N1) with any serial terminal and start writing C interactively.
 
@@ -42,10 +40,7 @@ Serial Task (priority 40)                PicoC Task (priority 24)
 
 **Abort path:** `:abort` → serialTask calls `PicocApp_Abort()` → sets `AbortRequested=1` → PicoC loop condition fails → `ProgramFail` → `PlatformExit` → `longjmp` back to task loop → REPL prompt.
 
-## Current Status (Beta)
-
-### Known Issue
-- Breakpoint single-step (`:step`) and continue (`:cont`) are currently broken - investigating
+## Current Status
 
 ### Done
 - FreeRTOS (CMSIS_V2, Kernel V10.6.2) fully configured and compiling
@@ -53,10 +48,11 @@ Serial Task (priority 40)                PicoC Task (priority 24)
 - serialTask: protocol parsing, `:ping`/`:abort`/`:reset` handling, source line queuing
 - PicoC cooperative abort checkpoints in `while`/`for`/`do-while` and blocking I/O
 - Abort cleanup: interpreter reset after `longjmp`, no memory leaks
-- Phase 3: Message queue protocol routing for all commands
-- Phase 4: picocTask full logic implementation (REPL + file execution in task context)
-- Phase 5: End-to-end abort verification (all 5 test scenarios)
-- Phase 6: Cleanup (remove dead code, rename tasks, full test suite)
+- Message queue protocol routing for all commands
+- picocTask full logic (REPL + file execution in task context)
+- End-to-end abort verification (all 5 test scenarios)
+- Full debug support: breakpoints, single-step (`:step`), continue (`:cont`), variable inspection (`:vars`), expression evaluation (`:eval`), variable modification (`:set`)
+- Cleanup: dead code removed, tasks renamed, full test suite
 
 ## Quick Start
 
@@ -154,11 +150,10 @@ The `:abort` command is processed by the high-priority serial task, which sets a
 - **Error recovery:** `setjmp/longjmp` within picocTask — script failures return to REPL cleanly
 - **Abort safety:** Cooperative flag check, no cross-task `longjmp` (undefined behavior avoided), same-task unwind only
 
-## Known Limitations (Beta)
+## Known Limitations
 
-- Migration not yet complete — some features may be unstable
 - Full PicoC test suite (68+ cases) not yet verified on hardware with FreeRTOS
-- Task priorities and stack sizes are initial estimates; may need tuning
+- Task priorities and stack sizes are initial estimates; may need tuning for complex workloads
 - No power management / sleep modes enabled
 
 ## Related Projects
