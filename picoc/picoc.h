@@ -8,9 +8,9 @@
 
 /* picoc version number */
 #ifdef VER
-#define PICOC_VERSION "v2.0 r" VER         /* VER is the subversion version number, obtained via the Makefile */
+#define PICOC_VERSION "v2.1.1 r" VER         /* VER is the subversion version number, obtained via the Makefile */
 #else
-#define PICOC_VERSION "v2.0"
+#define PICOC_VERSION "v2.1.1"
 #endif
 
 /* handy definitions */
