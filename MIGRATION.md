@@ -1,146 +1,251 @@
-# RICE 移植工作流 / Porting Workflow
+# RICE v2 — Porting Workflow
 
-本文档为开发者提供将 RICE（PicoC 嵌入式 C 解释器）移植到不同 MCU 平台的通用方法论。适用于 RICE v1（裸机）和 v2（FreeRTOS）。
-
-This document provides a universal methodology for porting RICE (PicoC embedded C interpreter) to different MCU platforms. Applicable to both RICE v1 (bare-metal) and v2 (FreeRTOS).
+Complete guide for porting RICE v2 (PicoC embedded C interpreter + FreeRTOS) to different MCU platforms.
 
 ---
 
-## 移植架构总览 / Architecture Overview
-
-RICE 采用分层架构，移植时只需修改底层硬件相关代码，上层逻辑完全复用。
-
-RICE uses a layered architecture. Only the bottom hardware-dependent layer needs modification; upper layers are fully reusable.
+## 1. Architecture Layers
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  PicoC 解释器核心（无需修改 / No changes needed）             │
-│  picoc/*.c  — 解释器、解析器、调试器                          │
-├─────────────────────────────────────────────────────────────┤
-│  平台适配层（移植重点 / Porting focus）                       │
-│  picoc/platform/platform_*.c  — I/O 桥接                     │
-│  picoc/platform/library_*.c   — 外设函数绑定                  │
-├─────────────────────────────────────────────────────────────┤
-│  应用层（少量适配 / Minor adaptation）                        │
-│  Core/Src/picoc_app.c   — REPL 状态机、协议解析               │
-│  Core/Src/serial_app.c  — 串口 DMA 收发                      │
-├─────────────────────────────────────────────────────────────┤
-│  HAL 驱动层（需完全重写 / Must rewrite）                      │
-│  usart.c, dma.c, gpio.c  — CubeMX 生成或手写                 │
-└─────────────────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────────────────┐
+│  Layer 1: PicoC Interpreter Core (fully reusable, no changes)     │
+│  Files: picoc/*.c (lex.c, parse.c, expression.c, heap.c,        │
+│         table.c, type.c, variable.c, clibrary.c, include.c,      │
+│         debug.c, platform.c)                                      │
+│  Note: Pure C logic, no hardware API dependencies                 │
+├───────────────────────────────────────────────────────────────────┤
+│  Layer 2: Platform Adaptation (porting focus: rewrite per chip)   │
+│  Files: picoc/platform/platform_*.c — PicoC I/O bridge            │
+│         picoc/platform/library_*.c  — Peripheral function bindings│
+│         picoc/platform.h            — Heap size, feature flags    │
+│         picoc/picoc.h               — Platform macro guard        │
+│         picoc/interpreter.h         — Picoc_Struct sizing         │
+├───────────────────────────────────────────────────────────────────┤
+│  Layer 3: Application Layer (minor adaptation)                    │
+│  Files: Core/Src/picoc_app.c   — REPL state machine (~98% reuse) │
+│         Core/Src/serial_app.c  — Serial DMA driver (~80% reuse)  │
+│         Core/Src/freertos.c    — Task definitions (~85% reuse)   │
+│         Core/Inc/task_msg.h    — Inter-task messages (100% reuse)│
+├───────────────────────────────────────────────────────────────────┤
+│  Layer 4: HAL Driver Layer (CubeMX-generated, full rewrite)       │
+│  Files: main.c, usart.c, dma.c, gpio.c, stm32h7xx_it.c,        │
+│         stm32h7xx_hal_msp.c, stm32h7xx_hal_conf.h,              │
+│         stm32h7xx_hal_timebase_tim.c, system_stm32h7xx.c        │
+│         startup_stm32h750xx.s, FreeRTOSConfig.h                   │
+└───────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 移植检查清单 / Porting Checklist
+## 2. File Dependency Matrix
 
-### 第一步：硬件抽象层配置 / Step 1: Hardware Abstraction Layer
+### Files that MUST be fully rewritten (CubeMX-generated)
 
-| 任务 / Task | 文件 / Files | 说明 / Notes |
-|-------------|-------------|-------------|
-| CubeMX 配置新 MCU | `.ioc` 文件 | 生成 HAL 初始化代码 |
-| 配置 UART 外设 | `usart.c`, `usart.h` | 选择可用的 USART，配置引脚 |
-| 配置 DMA | `dma.c`, `dma.h` | RX: 循环模式; TX: 普通模式 |
-| 配置中断 | `stm32h7xx_it.c` | USART IDLE 中断 + DMA 完成中断 |
-| 时钟配置 | `SystemClock_Config()` | 确保 CPU 和外设时钟正确 |
-| MPU 配置 | `MPU_Config()` | Cortex-M7 需要，M4/M3 可省略 |
+| File | Lines | Reason for rewrite |
+|------|-------|--------------------|
+| `main.c` | 274 | Clock tree (HSE 25MHz → PLL → 480MHz), MPU, power config (LDO/SMPS), HAL callback routing |
+| `usart.c` | 190 | UART peripheral init, DMA stream assignment (DMA1_Stream0 RX circular, DMA1_Stream1 TX normal), GPIO AF mapping (PA9/PA10 AF7), NVIC priorities |
+| `dma.c` | 58 | DMA clock enable, IRQ priority setup |
+| `gpio.c` | 66 | GPIO clock enable, pin config (PC13 output) |
+| `stm32h7xx_it.c` | 224 | Interrupt vector names (DMA1_Stream0_IRQHandler, USART1_IRQHandler, TIM6_DAC_IRQHandler) |
+| `stm32h7xx_hal_msp.c` | 83 | Global MSP init (SYSCFG clock, PendSV priority) |
+| `stm32h7xx_hal_timebase_tim.c` | 132 | TIM6 as HAL timebase (required when FreeRTOS owns SysTick) |
+| `stm32h7xx_hal_conf.h` | 515 | HAL module selection, HSE_VALUE, VDD_VALUE |
+| `system_stm32h7xx.c` | ~450 | CMSIS system init (FPU enable, Flash latency, RCC reset) |
+| `FreeRTOSConfig.h` | 172 | `CMSIS_device_header`, `configCPU_CLOCK_HZ`, `configTOTAL_HEAP_SIZE`, NVIC priority bits, `vPortSVCHandler` mapping |
+| Startup file | — | Vector table (interrupt entry addresses) |
+| Linker script | — | Memory region definitions |
 
-**关键约束 / Key constraints:**
-- UART 必须支持 DMA 收发
-- 必须有 IDLE 线检测中断（或等效机制）
-- DMA RX 必须支持循环模式
+### Files that need minor modifications
 
-### 第二步：串口驱动层 / Step 2: Serial Driver Layer
+| File | What to change | What to keep |
+|------|---------------|-------------|
+| `serial_app.c` | `huart1` → new UART handle; `USART1` → new peripheral instance; `HAL_UARTEx_ReceiveToIdle_DMA` / `HAL_UART_Transmit_DMA` → new HAL API | Ring buffer logic (rx_ring/tx_ring/head/tail), `SerialApp_Read`/`SerialApp_Write`, `SerialApp_ProcessRxDma`, `SerialApp_RxRingWrite`, `SerialApp_TxDmaKick`, `g_debug_input_active` flag |
+| `serial_app.h` | `UART_HandleTypeDef` type (if switching away from STM32 HAL) | Public API declarations, `g_debug_input_active` |
+| `picoc/platform.h` | Add `#ifdef YOUR_MCU_HOST` block, set `HEAP_SIZE` per target RAM | Hash table sizes (97), `PARAMETER_MAX`, `LINEBUFFER_MAX`, prompt strings |
+| `picoc/picoc.h` | Add `defined(YOUR_MCU_HOST)` to `#if` guard | Public API prototypes |
+| `freertos.c` | Task stack sizes per target RAM, queue depth | Task loop logic, CMSIS-RTOS V2 API calls |
+| `picoc_app.c` | `osDelay(1)` → target RTOS yield (if not using CMSIS-RTOS V2) | Entire state machine (REPL/LOAD/DRAIN), protocol parsing, source completeness analysis, auto-expression wrapping |
 
-修改 `serial_app.c`，适配新 MCU 的 DMA/UART 寄存器。
+### Fully reusable files (zero modifications)
 
-Modify `serial_app.c` to match the new MCU's DMA/UART registers.
+| File | Lines | Description |
+|------|-------|-------------|
+| `picoc_app.h` | 49 | Application layer API declarations |
+| `task_msg.h` | 30 | Inter-task message struct |
+| `picoc/debug.c` | 783 | Debugger (breakpoint hash table, step, eval, variable inspection) |
+| `picoc/parse.c` | ~1000 | Parser (with AbortRequested checkpoints) |
+| `picoc/expression.c` | ~2000 | Expression evaluator |
+| `picoc/lex.c` | ~800 | Lexer |
+| `picoc/heap.c` | ~200 | Memory allocator |
+| `picoc/table.c` | ~300 | Hash table implementation |
+| `picoc/type.c` | ~500 | Type system |
+| `picoc/variable.c` | ~400 | Variable management |
+| `picoc/clibrary.c` | ~200 | C standard library init |
+| `picoc/platform.c` | ~100 | Platform-agnostic wrappers |
+| `picoc/include.c` | ~200 | `#include` system |
+| `picoc/cstdlib/*.c` | 9 files | Mini C stdlib (ctype, errno, math, stdbool, stdio, stdlib, string, time, unistd) |
 
-**需要修改的部分 / What to change:**
+---
 
-| 组件 | v1/v2 现状 | 移植时需改 |
-|------|-----------|-----------|
-| DMA 缓冲区 | `rx_dma_buffer[1024]` | 不改 |
-| 环形缓冲区 | `rx_ring[8192]` / `tx_ring[8192]` | 不改 |
-| DMA 启动 | `HAL_UARTEx_ReceiveToIdle_DMA(&huart1, ...)` | 改 `huart1` 为新 UART 句柄 |
-| DMA 发送 | `HAL_UART_Transmit_DMA(&huart1, ...)` | 同上 |
-| 回调路由 | `main.c` 中的 HAL 回调 | 不改（HAL 回调机制通用） |
+## 3. Step-by-Step Porting Guide
 
-**v2 额外修改 / v2 additional changes:**
-- `SerialApp_InitMutex()` — FreeRTOS 互斥锁，与芯片无关
-- `SerialApp_RxEventCallback()` 中的 `xTaskNotifyFromISR` — 与芯片无关
+### Step 1: CubeMX Project Setup
 
-### 第三步：平台 I/O 适配 / Step 3: Platform I/O Adaptation
+Create a CubeMX project for the target MCU with these peripherals:
 
-创建 `picoc/platform/platform_<芯片型号>.c`，实现以下函数：
+**UART Configuration:**
+- Mode: Asynchronous
+- Baud: 115200, 8N1, no hardware flow control
+- Pins: Select available TX/RX pins (current H750 uses PA9/PA10)
+- GPIO speed: Very High
 
-Create `picoc/platform/platform_<chip>.c`, implementing these functions:
+**DMA Configuration (critical):**
+- RX DMA: Circular mode, byte alignment, high priority, FIFO disabled
+- TX DMA: Normal mode, byte alignment, medium priority, FIFO disabled
+- Must support DMA circular receive (otherwise must switch to interrupt mode)
 
-| 函数 | 签名 | 说明 |
-|------|------|------|
-| `PlatformInit` | `void PlatformInit(Picoc *pc)` | 平台初始化（通常为空） |
-| `PlatformCleanup` | `void PlatformCleanup(Picoc *pc)` | 平台清理（通常为空） |
-| `PlatformGetLine` | `char *PlatformGetLine(char *Buf, int MaxLen, const char *Prompt)` | 读取一行输入（带回显） |
-| `PlatformGetLineQuiet` | `char *PlatformGetLineQuiet(char *Buf, int MaxLen)` | 读取一行输入（无回显，调试器用） |
-| `PlatformGetCharacter` | `int PlatformGetCharacter(void)` | 读取单个字符（阻塞） |
-| `PlatformPutc` | `void PlatformPutc(unsigned char ch, union OutputStreamInfo *Stream)` | 输出单个字符 |
-| `PlatformReadFile` | `char *PlatformReadFile(Picoc *pc, const char *FileName)` | 读取文件（嵌入式通常不支持） |
-| `PlatformExit` | `void PlatformExit(Picoc *pc, int RetVal)` | 退出执行（`longjmp`） |
+**NVIC Configuration (v2 key difference):**
+- DMA RX/TX interrupt priority: ≥ `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` (currently 5)
+- USART interrupt priority: same (≥ 5)
+- **Reason:** FreeRTOS requires ISRs calling `FromISR` APIs to have priority ≥ 5. v1 bare-metal uses priority 0 — must adjust when porting to v2.
 
-**模板代码 / Template:**
+**FreeRTOS Configuration:**
+- Interface: CMSIS_V2
+- Timebase: SysTick (for FreeRTOS kernel)
+- HAL timebase: Must use a separate timer (e.g., TIM6), cannot share with SysTick
+
+**Clock Configuration:**
+- HSE: Configure external crystal frequency (current 25 MHz)
+- PLL: Calculate target SYSCLK (current 480 MHz)
+- Note voltage scaling (Scale 0 is H7-series specific)
+
+### Step 2: HAL Timebase Timer
+
+When FreeRTOS uses SysTick as kernel timebase, HAL's `HAL_Delay()` and `HAL_IncTick()` need a separate timer.
+
+**Current implementation (TIM6):**
+```c
+// stm32h7xx_hal_timebase_tim.c
+HAL_InitTick(TICK_INT_PRIORITY):
+  1. HAL_NVIC_SetPriority(TIM6_DAC_IRQn, TickPriority, 0)
+  2. __HAL_RCC_TIM6_CLK_ENABLE()
+  3. Calculate prescaler: (PCLK1_freq / 10000) - 1
+  4. Set period: 10000 - 1 (produces 1ms interrupt)
+  5. HAL_TIM_Base_Init() + HAL_TIM_Base_Start_IT()
+```
+
+**When porting:**
+- Select a basic timer (no output pins, e.g., TIM6/TIM7)
+- If target MCU lacks basic timers, use a general-purpose timer
+- Configure for 1ms interrupt period
+- Call `HAL_IncTick()` in the interrupt handler
+
+### Step 3: FreeRTOSConfig.h
+
+Key settings to modify:
+
+| Setting | Current value | Porting change |
+|---------|---------------|----------------|
+| `CMSIS_device_header` | `"stm32h7xx.h"` | Change to target chip header |
+| `configCPU_CLOCK_HZ` | `SystemCoreClock` | Usually no change (auto-reads) |
+| `configTOTAL_HEAP_SIZE` | 49152 (48 KB) | Adjust per target RAM |
+| `configENABLE_FPU` | 1 | 1 if target has FPU, 0 if not |
+| `configPRIO_BITS` | `__NVIC_PRIO_BITS` or 4 | Per target MCU's NVIC priority bits |
+| `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY` | 5 | Do not change (keep 5, ensures DMA/UART ISRs can call FromISR APIs) |
+| `vPortSVCHandler` | `SVC_Handler` | Confirm target MCU exception handler names match |
+
+**FreeRTOS Port Selection:**
+- Cortex-M7/M4/M3: Use `portable/RVDS/ARM_CM4F/` (with FPU) or `ARM_CM3/` (no FPU)
+- Cortex-M0/M0+: Use `portable/RVDS/ARM_CM0/`
+- RISC-V/Xtensa etc.: Use corresponding port directory
+
+### Step 4: Serial Driver Adaptation (serial_app.c)
+
+**3 hardware call sites to modify:**
 
 ```c
-#include "../picoc.h"
-#include "../interpreter.h"
-#include "picoc_app.h"
-#include "serial_app.h"
+// 1. DMA receive start (original: HAL_UARTEx_ReceiveToIdle_DMA)
+SerialApp_StartRxDma():
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart1, rx_dma_buffer, 1024)
+  // Change to new UART handle
 
-char *PlatformGetLineQuiet(char *Buf, int MaxLen)
+// 2. DMA transmit start (original: HAL_UART_Transmit_DMA)
+SerialApp_TxDmaKick():
+  HAL_UART_Transmit_DMA(&huart1, &tx_ring[tx_tail], len)
+  // Change to new UART handle
+
+// 3. Peripheral instance filter
+SerialApp_RxEventCallback():
+  if (huart->Instance == USART1)  // Change to new peripheral instance
+```
+
+**What NOT to modify:**
+- Ring buffer arrays (rx_ring[8192], tx_ring[8192], rx_dma_buffer[1024])
+- `SerialApp_Read()` / `SerialApp_Write()` — pure buffer operations
+- `SerialApp_ProcessRxDma()` — DMA-to-ring copy with wrap-around handling
+- `SerialApp_RxRingWrite()` — ring buffer write
+- `SerialApp_TxDmaKick()` — TX DMA trigger logic (only the HAL call line changes)
+- `g_debug_input_active` flag — hardware-independent debug coordination
+- `osMutexNew` / `osMutexAcquire` / `osMutexRelease` — portable CMSIS-RTOS V2 APIs
+
+**Non-STM32 serial adaptation:**
+If target is not STM32 (no HAL), you need to:
+1. Implement equivalent DMA circular receive (or switch to interrupt receive + callback filling rx_ring)
+2. Implement equivalent DMA transmit (or switch to interrupt transmit + reading from tx_ring)
+3. Call `xTaskNotifyFromISR()` in the receive completion callback to wake serialTask
+
+### Step 5: Platform I/O Adaptation (platform_*.c)
+
+Create `picoc/platform/platform_your_mcu.c` implementing these 8 functions:
+
+```c
+// Must implement 2 low-level I/O primitives:
+int PicocApp_ConsoleGetCharBlocking(void);  // Blocking single-char read
+// Implementation: loop calling SerialApp_Read(), osDelay(1) when no data
+// Must check AbortRequested flag (see below)
+
+void SerialApp_Write(const uint8_t *data, uint32_t len);
+// Already implemented in serial_app.c, no rewrite needed
+
+// The following can be copied directly from existing platform_stm32h7.c:
+char *PlatformGetLineQuiet(char *Buf, int MaxLen);  // Silent line read
+char *PlatformGetLine(char *Buf, int MaxLen, const char *Prompt);  // Echo line read
+int PlatformGetCharacter(void);  // Calls PicocApp_ConsoleGetCharBlocking
+void PlatformPutc(unsigned char ch, union OutputStreamInfo *Stream);  // Calls SerialApp_Write
+void PlatformInit(Picoc *pc);  // Empty function
+void PlatformCleanup(Picoc *pc);  // Empty function
+void PlatformExit(Picoc *pc, int RetVal);  // longjmp(pc->PicocExitBuf, 1)
+char *PlatformReadFile(Picoc *pc, const char *FileName);  // Returns error
+void PicocPlatformScanFile(Picoc *pc, const char *FileName);  // Returns error
+```
+
+**v2-specific: AbortRequested check in PicocApp_ConsoleGetCharBlocking:**
+```c
+int PicocApp_ConsoleGetCharBlocking(void)
 {
-    int len = 0;
-    if (Buf == NULL || MaxLen <= 1) return NULL;
-    for (;;) {
-        int ch = PicocApp_ConsoleGetCharBlocking();
-        if (ch == '\r' || ch == '\n') {
-            Buf[len++] = '\n';
-            Buf[len] = '\0';
-            return Buf;
+    uint8_t ch;
+    Picoc *active = (g_active_picoc != NULL) ? g_active_picoc : &g_picoc;
+    while (SerialApp_Read(&ch, 1U) == 0U)
+    {
+        if (active->AbortRequested)  // v2 cooperative abort check
+        {
+            PlatformExit(active, 1);
         }
-        if (ch == '\b' || ch == 0x7f) {
-            if (len > 0) len--;
-            continue;
-        }
-        if (len < MaxLen - 2)
-            Buf[len++] = (char)ch;
+        osDelay(1);  // Yield CPU to serialTask
     }
-}
-
-// PlatformGetLine, PlatformGetCharacter, PlatformPutc 等
-// 参见现有 platform_stm32h7.c 的实现
-// See existing platform_stm32h7.c for implementation
-
-void PlatformExit(Picoc *pc, int RetVal)
-{
-    pc->PicocExitValue = RetVal;
-    longjmp(pc->PicocExitBuf, 1);
+    return (int)ch;
 }
 ```
 
-**关键点 / Key points:**
-- 所有 I/O 最终调用 `PicocApp_ConsoleGetCharBlocking()`（输入）和 `SerialApp_Write()`（输出）
-- `PlatformExit` 必须使用 `longjmp`，不能用 `return`
-- `PlatformReadFile` 在嵌入式上返回错误即可
+### Step 6: Peripheral Function Bindings (library_*.c)
 
-### 第四步：外设函数绑定 / Step 4: Peripheral Function Bindings
+Create `picoc/platform/library_your_mcu.c` to expose target MCU peripheral functions to PicoC scripts.
 
-修改 `picoc/platform/library_<芯片型号>.c`，将新 MCU 的 HAL 函数暴露给 PicoC 脚本。
-
-Modify `picoc/platform/library_<chip>.c` to expose the new MCU's HAL functions to PicoC scripts.
-
-**三步注册流程 / Three-step registration:**
+**Three-step registration:**
 
 ```c
-// 1. 写包装函数 / Write wrapper function
+// Step 1: Write wrapper function
 static void PicocHalDelay(struct ParseState *Parser,
                            struct Value *ReturnValue,
                            struct Value **Param, int NumArgs)
@@ -149,174 +254,258 @@ static void PicocHalDelay(struct ParseState *Parser,
     HAL_Delay((uint32_t)Param[0]->Val->Integer);
 }
 
-// 2. 声明函数原型（供 PicoC 解析器使用）
-//    Declare function prototype (for PicoC parser)
+// Step 2: Declare function prototype (for PicoC parser)
 const char HalDelay[] = "void delay(int ms);";
 
-// 3. 在注册表中添加条目 / Add entry to registration table
-// 在 PlatformLibrary[] 数组中：
-//   { PicocHalDelay, HalDelay },
+// Step 3: Add to registration table
+const LibraryFunction Stm32Functions[] = {
+    { PicocHalDelay, HalDelay },
+    // ... other functions
+    { NULL, NULL }
+};
+
+void PlatformLibraryInit(Picoc *pc)
+{
+    IncludeRegister(pc, "stm32.h", &Stm32Defs, &Stm32Functions[0], NULL);
+}
 ```
 
-**需要绑定的外设 / Peripherals to bind:**
+**Recommended peripheral bindings:**
 
-| 外设 | 推荐暴露的函数 | 说明 |
-|------|--------------|------|
-| GPIO | `digitalWrite(pin, val)`, `digitalRead(pin)` | 基础 I/O |
-| Timer | `delay(ms)`, `micros()` | 时间控制 |
-| ADC | `analogRead(channel)` | 模拟输入 |
-| PWM | `analogWrite(pin, duty)` | 脉宽调制 |
-| UART | `serialWrite(port, data)`, `serialRead(port)` | 多串口 |
-| I2C | `i2cWrite(addr, data, len)` | 总线通信 |
-| SPI | `spiTransfer(cs, tx, rx, len)` | 高速通信 |
+| Peripheral | Wrapper example | PicoC prototype |
+|-----------|----------------|-----------------|
+| GPIO | `PicocHalGpioWritePin` | `void digitalWrite(void *port, int pin, int state)` |
+| GPIO | `PicocHalGpioReadPin` | `int digitalRead(void *port, int pin)` |
+| GPIO | `PicocHalGpioInit` | `void pinMode(void *port, int pin, int mode, int pull, int speed)` |
+| Delay | `PicocHalDelay` | `void delay(int ms)` |
+| ADC | `PicocAnalogRead` | `int analogRead(int channel)` |
+| PWM | `PicocAnalogWrite` | `void analogWrite(int pin, int duty)` |
+| I2C | `PicocI2cWrite` | `int i2cWrite(int addr, int *data, int len)` |
+| SPI | `PicocSpiTransfer` | `int spiTransfer(int cs, int *tx, int *rx, int len)` |
 
-### 第五步：PicoC 配置 / Step 5: PicoC Configuration
+**Constants to register:**
+- GPIO port addresses (GPIOA ~ GPIOn)
+- GPIO pin numbers (GPIO_PIN_0 ~ GPIO_PIN_15)
+- GPIO modes (INPUT/OUTPUT_PP/OUTPUT_OD/ANALOG)
+- GPIO pull (NOPULL/PULLUP/PULLDOWN)
+- GPIO speed (LOW/MEDIUM/HIGH/VERY_HIGH)
 
-修改 `picoc/platform.h` 中的平台宏：
+### Step 7: PicoC Configuration (platform.h)
 
-Modify platform macros in `picoc/platform.h`:
-
-| 宏 | 说明 | 典型值 |
-|----|------|--------|
-| `HEAP_SIZE` | PicoC 堆大小 | 64 KB（根据 SRAM 调整） |
-| `NO_FP` | 禁用浮点 | 不定义（保留浮点支持） |
-| `NO_DEBUGGER` | 禁用调试器 | 不定义（保留调试支持） |
-| `NO_HASH_INCLUDE` | 禁用 `#include` | 不定义 |
-| `BUILTIN_MINI_STDLIB` | 使用最小标准库 | 定义（嵌入式推荐） |
-
-### 第六步：应用层适配 / Step 6: Application Layer Adaptation
-
-**v1（裸机 / bare-metal）：**
-
-修改 `main.c` 中的主循环：
+Add a platform configuration block in `picoc/platform.h`:
 
 ```c
-// main() 中：
-SerialApp_Init();
-PicocApp_Init();
-while (1) {
-    PicocApp_Task();  // 轮询串口 + 执行 PicoC
-}
+#ifdef YOUR_MCU_HOST
+# define BUILTIN_MINI_STDLIB        // Use PicoC's built-in mini stdlib
+# define HEAP_SIZE (64*1024)        // PicoC heap size (adjust per target RAM)
+# define PICOC_MATH_LIBRARY         // Enable math functions
+# define FEATURE_AUTO_DECLARE_VARIABLES  // Allow implicit int declarations
+# define FANCY_ERROR_MESSAGES       // Detailed error messages
+#endif
 ```
 
-**v2（FreeRTOS）：**
+**HEAP_SIZE adjustment guide:**
 
-修改 `freertos.c` 中的任务实现：
+| Target MCU SRAM | Recommended HEAP_SIZE | Notes |
+|----------------|----------------------|-------|
+| ≥ 256 KB | 64 KB | Current H750 config |
+| 128~256 KB | 32 KB | Smaller heap, features mostly intact |
+| 64~128 KB | 16 KB | Minimum usable, complex scripts may fail |
+| < 64 KB | Not recommended | PicoC itself needs substantial memory |
 
-```c
-void StartSerialTask(void *argument) {
-    uint8_t buf[256];
-    TaskMsg msg;
-    for (;;) {
-        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(10));
-        uint32_t len = SerialApp_Read(buf, sizeof(buf));
-        if (len > 0) {
-            PicocApp_ProcessChars(buf, len, &msg);
-            osMessageQueuePut(uartQueneHandle, &msg, 0U, 0U);
-        }
-    }
-}
+### Step 8: Interrupt Priority Adjustment (v2 key)
 
-void StartPicocTask(void *argument) {
-    TaskMsg msg;
-    for (;;) {
-        if (osMessageQueueGet(uartQueneHandle, &msg, NULL, osWaitForever) == osOK) {
-            switch (msg.type) {
-                case MSG_SOURCE_LINE: PicocApp_RunSourceLine(msg.data); break;
-                case MSG_LOAD_END:    PicocApp_ExecuteLoadSource(); break;
-                case MSG_RESET:       PicocApp_Reset(); break;
-                // ...
-            }
-        }
-    }
-}
+v2 uses FreeRTOS, interrupt priorities must satisfy:
+
+```
+configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY = 5
+
+Priority 0-4: Highest priority, cannot call FreeRTOS FromISR APIs
+Priority 5-15: Can call FreeRTOS FromISR APIs
+
+Current v2 configuration:
+  DMA1_Stream0 (RX): priority 5  ← can call xTaskNotifyFromISR
+  DMA1_Stream1 (TX): priority 5  ← can call xTaskNotifyFromISR
+  USART1: priority 5             ← can call FromISR APIs
+  TIM6 (HAL timebase): priority 15  ← only calls HAL_IncTick
+  SysTick: priority 15           ← FreeRTOS kernel
+  PendSV: priority 15            ← FreeRTOS context switch
+  SVC: priority 0                ← FreeRTOS system calls
 ```
 
-### 第七步：编译配置 / Step 7: Build Configuration
+**When porting, ensure:**
+- DMA/UART interrupt priority ≥ `configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY`
+- PendSV must be lowest priority (15)
+- SVC priority must be 0
 
-**Keil MDK：**
-1. 在 Manage Project Items 中添加 PicoC 源文件组
-2. Include Paths 添加 `picoc/`、`picoc/platform/`、`Core/Inc/`
-3. C 预处理宏：`USE_HAL_DRIVER`、`<芯片型号>`（如 `STM32F407xx`）
-4. 堆栈大小：Heap ≥ 64 KB（PicoC 堆），Stack ≥ 8 KB
+### Step 9: Build Configuration
 
-**GCC / CMake：**
+**Keil MDK:**
+
+Preprocessor defines:
+```
+USE_PWR_LDO_SUPPLY    // STM32 power mode (adjust per target MCU)
+USE_HAL_DRIVER        // Enable HAL library
+STM32H750xx           // Chip model macro (change to target)
+YOUR_MCU_HOST         // PicoC platform selection macro
+```
+
+Include paths:
+```
+../Core/Inc
+../Drivers/<target_series>_HAL_Driver/Inc
+../Drivers/CMSIS/Device/ST/<target_series>/Include
+../Drivers/CMSIS/Include
+../picoc
+../picoc/platform
+../picoc/cstdlib
+../Middlewares/Third_Party/FreeRTOS/Source/include
+../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS_V2
+../Middlewares/Third_Party/FreeRTOS/Source/portable/RVDS/<corresponding_port>
+../Drivers/CMSIS/RTOS2/Include
+```
+
+Source groups (7 groups):
+1. **Startup** — startup_<chip>.s
+2. **App/Core** — serial_app.c, picoc_app.c, main.c, gpio.c, freertos.c, dma.c, usart.c, stm32<series>_it.c, stm32<series>_hal_msp.c, stm32<series>_hal_timebase_tim.c
+3. **App/PicoC** — clibrary.c, debug.c, expression.c, heap.c, include.c, lex.c, parse.c, platform.c, table.c, type.c, variable.c, platform_<chip>.c, library_<chip>.c
+4. **HAL Driver** — hal_uart, hal_dma, hal_gpio, hal_rcc, hal_flash, hal_pwr, hal_cortex, hal_tim, etc.
+5. **CMSIS** — system_<series>.c
+6. **PicoC/cstdlib** — ctype.c, errno.c, math.c, stdbool.c, stdio.c, stdlib.c, string.c, time.c, unistd.c
+7. **FreeRTOS** — port.c, heap_4.c, tasks.c, queue.c, list.c, timers.c, event_groups.c, stream_buffer.c, cmsis_os2.c
+
+**GCC / CMake:**
 ```cmake
-# 添加 PicoC 源文件
-file(GLOB PICOCSRC picoc/*.c picoc/platform/*.c)
-target_sources(${PROJECT_NAME} PRIVATE ${PICOCSRC})
-target_include_directories(${PROJECT_NAME} PRIVATE picoc picoc/platform Core/Inc)
-target_compile_definitions(${PROJECT_NAME} PRIVATE USE_HAL_DRIVER STM32F407xx)
+# FreeRTOS port directory (select per target core)
+set(FREERTOS_PORT "GCC/ARM_CM4F" CACHE STRING "")  # Cortex-M7/M4 with FPU
+
+# PicoC source files
+file(GLOB PICOCSRC picoc/*.c picoc/platform/*.c picoc/cstdlib/*.c)
+
+# Compile definitions
+target_compile_definitions(${PROJECT_NAME} PRIVATE
+    USE_HAL_DRIVER
+    STM32H750xx       # Change to target model
+    YOUR_MCU_HOST     # PicoC platform selection
+)
 ```
 
----
+### Step 10: Memory Budget Verification
 
-## 芯片族移植指南 / MCU Family Guide
+Before porting, calculate whether the target MCU has enough RAM:
 
-### STM32 系列间移植 / Between STM32 Families
+**v2 Memory Budget:**
 
-| 原芯片 | 目标芯片 | 改动量 | 说明 |
-|--------|---------|--------|------|
-| STM32H750 | STM32H743 | 极小 | 同系列，改型号宏即可 |
-| STM32H750 | STM32F407 | 小 | DMA 控制器不同，需适配 DMA 配置 |
-| STM32H750 | STM32F103 | 中 | 无 DMA 循环接收，需改用中断模式 |
-| STM32H750 | STM32G0B1 | 中 | DMA 较简单，需适配 |
+| Consumer | Size | Source |
+|----------|------|--------|
+| FreeRTOS heap | 48 KB | `configTOTAL_HEAP_SIZE` (dynamic allocation) |
+| ├─ serialTask stack | 4 KB | Allocated from FreeRTOS heap |
+| ├─ picocTask stack | 32 KB | Allocated from FreeRTOS heap |
+| ├─ Message queue (16×68B) | 1088 B | Allocated from FreeRTOS heap |
+| └─ Mutex + Timer task | ~1.1 KB | Allocated from FreeRTOS heap |
+| PicoC heap (`HeapMemory`) | 64 KB | Static array in `Picoc_Struct` |
+| RX DMA buffer | 1 KB | Static in `serial_app.c` |
+| RX ring buffer | 8 KB | Static in `serial_app.c` |
+| TX ring buffer | 8 KB | Static in `serial_app.c` |
+| Source line buffer | 2 KB | Static in `picoc_app.c` |
+| Load buffer | 8 KB | Static in `picoc_app.c` |
+| ISR stack + globals | ~2 KB | Static allocation |
+| **Total** | **~144 KB** | |
 
-**DMA 差异要点 / DMA differences:**
+**Minimum RAM required: 192 KB**
 
-| 特性 | H7 | F4 | F1 | G0 |
-|------|----|----|----|----|
-| DMA 循环模式 | 支持 | 支持 | 不支持 | 支持 |
-| IDLE 中断 | `HAL_UARTEx_ReceiveToIdle_DMA` | 同左 | 需手动检测 | 同左 |
-| DMA 请求映射 | MUX | 固定 | 固定 | 固定 |
+**If target RAM is insufficient, adjust:**
 
-### 跨厂商移植 / Cross-Vendor Porting
-
-| 厂商 | 推荐方案 | 关键适配点 |
-|------|---------|-----------|
-| NXP (LPC/IMX) | MCUXpresso + UART DMA | DMA API 不同，需重写 serial_app |
-| Infineon (XMC) | DAVE + UART | 无 DMA 循环模式，用中断接收 |
-| Nuvoton (M480) | NuMaker + UART DMA | HAL 风格类似 STM32，较易移植 |
-| ESP32 | ESP-IDF + UART | FreeRTOS 原生支持，v2 架构更合适 |
-| RP2040 | Pico SDK + UART | DMA API 简单，移植较易 |
-
----
-
-## 移植验证 / Porting Verification
-
-按以下顺序逐层验证：
-
-Verify in this bottom-up order:
-
-| 步骤 | 验证内容 | 方法 |
-|------|---------|------|
-| 1 | 串口回显 | `SerialApp_Read` + `SerialApp_Write` 循环 |
-| 2 | REPL 交互 | 输入 `printf("hello\n");` 看输出 |
-| 3 | 多行输入 | 输入 `for` 循环，检查自动完整性检测 |
-| 4 | 文件上传 | `:load` → 源码 → `:end`，检查执行结果 |
-| 5 | 中断脚本 | 执行 `while(1){}` 后发 `:abort`（仅 v2） |
-| 6 | 调试功能 | 设断点 → 执行 → 命中 → `:step` / `:cont` |
-| 7 | 外设绑定 | PicoC 脚本中调用 `delay(100)` 等绑定函数 |
-| 8 | 压力测试 | 上传 68+ PicoC 测试用例全部通过 |
+| Parameter | Current | Minimum | Impact |
+|-----------|---------|---------|--------|
+| `HEAP_SIZE` | 64 KB | 16 KB | Complex scripts may run out of memory |
+| `rx_ring` / `tx_ring` | 8 KB each | 2 KB each | High-speed data transfer may overflow |
+| `g_load_buffer` | 8 KB | 2 KB | Large file upload limited |
+| `configTOTAL_HEAP_SIZE` | 48 KB | 24 KB | Reduce picocTask stack |
+| picocTask stack | 32 KB | 16 KB | Deep recursion may stack overflow |
 
 ---
 
-## 常见问题 / FAQ
+## 4. MCU Family Porting Reference
 
-**Q: PicoC 编译报 `undefined reference to PlatformXxx`**
-A: 未实现平台适配函数。检查 `platform_<chip>.c` 是否包含所有必需函数。
+### Between STM32 Families
 
-**Q: 串口能收不能发**
-A: 检查 DMA TX 配置和 `SerialApp_TxCpltCallback` 是否正确路由到 `SerialApp_TxCpltCallback`。
+| Source | Target | Effort | Key differences |
+|--------|--------|--------|-----------------|
+| STM32H750 | STM32H743 | Minimal | Same family, change model macro and Flash size |
+| STM32H750 | STM32F407 | Medium | Different DMA controller (Stream vs Channel), no FIFO threshold config, different clock tree, no MPU (can remove MPU_Config) |
+| STM32H750 | STM32F103 | Large | No DMA circular receive (must use interrupt mode), no `HAL_UARTEx_ReceiveToIdle_DMA` (must manually detect IDLE), completely different clock tree |
+| STM32H750 | STM32G0B1 | Medium | Simpler DMA, no MPU, different clock tree |
+| STM32H750 | STM32L476 | Medium | Low-power series, different DMA controller, different clock tree |
 
-**Q: REPL 无响应，看不到 `picoc>` 提示符**
-A: 检查 `PicocApp_Init()` 是否在 `main()` 中调用，以及 `PicocApp_Task()` 是否在主循环中。
+### Cross-Vendor Porting
 
-**Q: 文件上传后无输出**
-A: 检查 `main()` 函数是否在源码中定义。PicoC 会自动调用 `main()`。
+| Vendor | Recommended approach | Serial adaptation strategy |
+|--------|---------------------|---------------------------|
+| NXP (LPC/IMXRT) | MCUXpresso + LPUART + eDMA | Rewrite serial_app.c HAL calls, reuse ring buffers |
+| Nuvoton (M480) | NuMaker + UART + PDMA | HAL style similar to STM32, minimal changes |
+| RP2040 | Pico SDK + UART + DMA | Simple DMA API, `uart_read_blocking`/`uart_write_blocking` can substitute |
+| ESP32 | ESP-IDF + UART + DMA | Native FreeRTOS support, `uart_driver_install` + `uart_read_bytes` |
+| GD32 | GD32 HAL + USART + DMA | Highly compatible with STM32 HAL, minimal changes |
 
-**Q: 断点不生效**
-A: 确保断点文件名与上传时的文件名一致（默认为 `serial_load`）。
+---
 
-**Q: 堆栈溢出（HardFault）**
-A: 增大 `HEAP_SIZE`（PicoC 堆）和任务栈大小（v2）。推荐 PicoC 堆 64 KB，picocTask 栈 16 KB。
+## 5. Porting Verification Checklist
+
+Verify in this bottom-up order. Only proceed to the next step after the current one passes:
+
+| Step | What to verify | Test method | Expected result |
+|------|---------------|-------------|-----------------|
+| 1 | Basic serial communication | `SerialApp_Read` + `SerialApp_Write` echo loop | Input echoed back |
+| 2 | REPL mode | Enter `printf("hello\n");` | Output `hello` |
+| 3 | Expression evaluation | Enter `3 + 5 * 2` | Output `13` |
+| 4 | Multi-line input | Enter `for` loop | Auto-detect completeness, execute |
+| 5 | File upload | `:load` → source → `:end` | Execute and output results |
+| 6 | Heartbeat | `:ping` | Receive `:pong` |
+| 7 | Reset | `:reset` | Receive `:ok` |
+| 8 | Abort script | Execute `while(1){}`, then `:abort` | Receive `:err aborted`, return to REPL |
+| 9 | Heartbeat during script | Send `:ping` while `while(1){}` runs | Receive `:pong` |
+| 10 | Set breakpoint | `:bkpt serial_load 5` | Receive `:ok bkpt` |
+| 11 | Breakpoint hit | Upload script with breakpoint, execute | Receive `:break serial_load 5 0` |
+| 12 | Single-step | `:step` | Receive `:step serial_load 6 0` |
+| 13 | Continue | `:cont` | Continue to next breakpoint or end |
+| 14 | Expression eval (debug) | `:eval x + 1` | Output evaluation result |
+| 15 | Variable inspection | `:vars` | Receive `:var` list and `:ok vars` |
+| 16 | Variable modification | `:set x 100` | Receive `:ok set` |
+| 17 | Multiple breakpoints | Set 3 breakpoints, hit each | All pause and continue correctly |
+| 18 | Peripheral bindings | Call `delay(100)` in PicoC script | Normal delay |
+| 19 | Stress test | Upload 68+ PicoC test cases | All pass |
+
+---
+
+## 6. FAQ
+
+**Q: Compile error `undefined reference to PlatformXxx`**
+A: Platform adaptation functions not implemented. Check that `platform_your_mcu.c` contains all 8 required functions.
+
+**Q: Compile error `undefined reference to xTaskNotifyFromISR`**
+A: `configUSE_TASK_NOTIFICATIONS` not enabled in FreeRTOS config. Add `#define configUSE_TASK_NOTIFICATIONS 1` in `FreeRTOSConfig.h`.
+
+**Q: Serial can receive but not transmit**
+A: Check DMA TX configuration, verify `HAL_UART_TxCpltCallback` routes to `SerialApp_TxCpltCallback`, confirm NVIC interrupt is enabled.
+
+**Q: REPL unresponsive, no `picoc>` prompt**
+A: Check `main()` call order: `SerialApp_Init()` → `PicocApp_Init()` → `osKernelInitialize()` → `MX_FREERTOS_Init()` → `osKernelStart()`.
+
+**Q: No output after file upload**
+A: Check that the source code defines a `main()` function. PicoC auto-calls `main()`.
+
+**Q: `:abort` doesn't work, script can't be interrupted**
+A: Check that `AbortRequested` checkpoints are correctly added in `parse.c`. Confirm `PicocApp_Abort()` is called by serialTask and sets `g_picoc.AbortRequested = 1`.
+
+**Q: Breakpoints don't work**
+A: 1) Confirm breakpoint filename matches upload filename (default `serial_load`). 2) Confirm `DebugCheckStatement()` is called before every statement (check call sites in `picoc/parse.c`). 3) Confirm `g_debug_input_active` flag is correctly set when breakpoint is hit.
+
+**Q: Stack overflow (HardFault)**
+A: 1) Increase `configTOTAL_HEAP_SIZE` (FreeRTOS heap). 2) Increase picocTask stack size. 3) Increase `HEAP_SIZE` (PicoC heap). 4) Check target MCU total SRAM ≥ 192 KB.
+
+**Q: Compile error `jmp_buf` undefined**
+A: Confirm compiler supports `<setjmp.h>`. ARMCC, GCC, IAR all support it. Confirm platform macro guard in `picoc/picoc.h` includes your target macro.
+
+**Q: HardFault immediately after FreeRTOS starts**
+A: 1) Check stack alignment (Cortex-M requires 8-byte alignment). 2) Check `configTOTAL_HEAP_SIZE` doesn't exceed actual available RAM. 3) Check startup file heap/stack size settings.
