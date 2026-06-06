@@ -359,7 +359,6 @@ picoc>
 
 ## Known Limitations
 
-- Full PicoC test suite (68+ cases) not yet verified on hardware with FreeRTOS
 - Task priorities and stack sizes are initial estimates; may need tuning for complex workloads
 - No power management / sleep modes enabled
 
